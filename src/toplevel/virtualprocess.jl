@@ -341,7 +341,7 @@ These configurations will be active for all the top-level entries explained in t
   See [`virtualize_module_context`](@ref) for the internal.
 ---
 """
-struct ToplevelConfig
+mutable struct ToplevelConfig
     pkgid::Union{Nothing,PkgId}
     context::Module
     analyze_from_definitions::Union{Bool,Symbol}
@@ -450,7 +450,7 @@ mutable struct InterpretationState
     curline::Int
     const dependencies::Set{Symbol}
     const context::Module
-    const config::ToplevelConfig
+    config::ToplevelConfig
     const res::VirtualProcessResult
     const pkg_mod_depth::Int
     const files_stack::Vector{String}
@@ -1499,6 +1499,12 @@ end
 
 function usemodule_with_err_handling(interp::ConcreteInterpreter, ex::Expr)
     state = InterpretationState(interp)
+
+    @inline _indent() = repeat("  ", max(state.pkg_mod_depth, 0))
+    @inline _inf(msg) = @info string(_indent(), "│ ", msg)
+
+    _inf("Start: $ex")
+
     mod = state.context
     if isexpr(ex, (:export, :public))
         @goto eval_usemodule
@@ -1522,27 +1528,71 @@ function usemodule_with_err_handling(interp::ConcreteInterpreter, ex::Expr)
                 dependencies = state.dependencies
                 if dep ∉ dependencies
                     depstr = String(dep)
-                    depid = Base.identify_package(pkgid, depstr)
-                    if depid === nothing
-                        # IDEA better message in a case of `any(m::Module->dep===nameof(m), res.defined_modules))`?
+                    _inf("Trying to fix module usage for dependency: $depstr in $(pkgid.name)")
+                    required_pkgenv = Base.identify_package_env(pkgid, depstr)
+                    if required_pkgenv === nothing
                         local report = DependencyError(pkgid.name, depstr, state.filename, state.curline)
+                        _inf("Failed to identify package dependency: $depstr. Not installed?")
                         add_toplevel_error_report!(state, report)
                         return nothing
                     end
-                    require_ex = :(const $dep = Base.require($depid))
-                    # TODO better handling of loading errors that may happen here
-                    require_res = with_err_handling(general_err_handler, state; scrub_offset=1) do
-                        Core.eval(mod, require_ex)
+                    required_pkgid, required_env = required_pkgenv
+                    # If the package already loaded in `__toplevel__`, we can just use it
+                    # maybe_mod = Base.maybe_root_module(required_pkgid)
+                    # if maybe_mod isa Module
+                    #     _inf("$depstr is already loaded.")
+                    #     loaded_mod = maybe_mod
+                    # else
+                        path = Base.locate_package(required_pkgid, required_env)
+                        if path === nothing
+                            local report = DependencyError(pkgid.name, depstr, state.filename, state.curline)
+                            _inf("mmmm.... `identify_package_env` returned something, but `locate_package` failed to find the package: $depstr. Something wrong?")
+                            add_toplevel_error_report!(state, report)
+                            return nothing
+                        end
+                        _inf("Identified package dependency: $depstr in $path ... env: $required_env")
+                        interp.state.config.pkgid = required_pkgid
+                        required_uuid = required_pkgid.uuid
+                        required_uuid = (required_uuid === nothing ? (UInt64(0), UInt64(0)) : convert(NTuple{2, UInt64}, required_uuid))
+                        old_uuid = ccall(:jl_module_uuid, NTuple{2, UInt64}, (Any,), Base.__toplevel__)
+                        if required_uuid !== old_uuid
+                            ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), Base.__toplevel__, required_uuid)
+                        end
+                        handle_include(
+                            interp,
+                            Base.include,
+                            [Base.__toplevel__, path]
+                        )
+                        if required_uuid !== old_uuid
+                            ccall(:jl_set_module_uuid, Cvoid, (Any, NTuple{2, UInt64}), Base.__toplevel__, old_uuid)
+                        end
+                        interp.state.config.pkgid = pkgid
+                        loaded_mod = Base.maybe_root_module(required_pkgid)
+                    # end
+                    if loaded_mod === nothing
+                        _inf("Failed to load dependency: $depstr it's return nothing!!!")
+                        return 
+                    end
+                    _inf("loaded in __toplevel__. Now trying to introduce: $loaded_mod -> $mod")
+                    _inf("Number of loaded module: $(length(Base.loaded_modules))")
+                    load_dep = with_err_handling(general_err_handler, state; scrub_offset=1) do
+                        Core.eval(mod, :(const $dep = $loaded_mod))
+                        Core.eval(mod, :(println(stderr, "Hi! from ", @__MODULE__, ". I got:", $dep, " type:", typeof($dep))))
                         true
                     end
-                    isnothing(require_res) && return nothing
+                    if isnothing(load_dep)
+                        _inf("load_dep is nothing. Failed?")
+                        return nothing
+                    end
                     push!(dependencies, dep)
                 end
                 pushfirst!(modpath, :.)
             end
             fixed_module_usage = ModuleUsage(module_usage; modpath)
             ex = form_module_usage(fixed_module_usage)
+            _inf("Fixed module usage: $ex")
         elseif dep === :.
+            _inf("dep === :., no need to fix module usage")
             # The syntax `import ..Submod` refers to the name that is available within
             # a parent module specified by the number of `.` dots, indicating how many
             # levels up the module hierarchy to go. However, when it comes to package
@@ -1564,21 +1614,40 @@ function usemodule_with_err_handling(interp::ConcreteInterpreter, ex::Expr)
                     curmod = parentmodule(curmod)
                 end
             end
+        else
+            _inf("No need to fix module usage")
+            # no need to fix module usage, just use it as is
         end
     end
     @label eval_usemodule
-    # `scrub_offset = 1`: `Core.eval`
+    # # `scrub_offset = 1`: `Core.eval`
+    _inf("Evaluating module usage: $ex in $mod")
     with_err_handling(general_err_handler, state; scrub_offset=1) do
         Core.eval(mod, ex)
         true
     end
+
+    _inf("Finish: $ex")
+
+    return true
 end
+
+
 
 function JuliaInterpreter.step_expr!(interp::ConcreteInterpreter, frame::Frame, @nospecialize(node), istoplevel::Bool)
     @assert istoplevel "ConcreteInterpreter can only work for top-level code"
 
+
+    # if isexpr(node, :export) || isexpr(node, :public)
+    #     @info "This is `step_expr!`, Hello $node !"
+    # end
+
     if ismoduleusage(node)
+        @info "found module usage: $node"
+        i = 0
         for ex in to_simple_module_usages(node)
+            @info " └ [$i] $ex"
+            i += 1
             if usemodule_with_err_handling(interp, ex) === nothing
                 break
             end
@@ -1728,7 +1797,10 @@ function handle_include(interp::ConcreteInterpreter, @nospecialize(include_func)
     end
 
     included = try_read_file(interp, include_context, include_file)
-    isnothing(included) && return nothing # typically no file error
+    if isnothing(included) 
+        @info "!!!!!! Failed to read file: $include_file"
+        return nothing # typically no file error
+    end
     if !(included isa AbstractString || included isa JS.SyntaxNode)
         @warn lazy"Unexpected value returned from `try_read_file(interp::$(nameof(typeof(interp))), ...)" typeof(included)
         return nothing
